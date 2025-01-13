@@ -8,7 +8,7 @@ from rotary import apply_rotary_emb
 import torch.nn as nn
 from torch.nn import functional as F
 
-dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+dtype = torch.float32 # torch.cuda.is_bf16_supported() is broken on Kaggle
 
 def flash_attention(q, k, v, causal=True):
     q = q.permute(0, 2, 1, 3) # [B, S, H, D] to [B, H, S, D]

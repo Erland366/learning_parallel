@@ -59,7 +59,7 @@ if __name__ == "__main__":
     backend = "nccl"
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
+    dtype = torch.float32 # torch.cuda.is_bf16_supported() is broken on Kaggle, always use fp32 instead
 
     dist.init_process_group(rank=global_rank, world_size=world_size, backend=backend, init_method=f"env://", timeout=datetime.timedelta(minutes=2.0))
     setup_process_group_manager(args.dp_size, args.pp_size, args.tp_size)
