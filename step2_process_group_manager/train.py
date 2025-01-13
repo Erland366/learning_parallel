@@ -1,4 +1,3 @@
-%%writefile step2_process_group_manager/train.py
 """
 torchrun --nproc_per_node 2 train.py --tp_size 2 --run_name process_group_manager --use_wandb
 """
