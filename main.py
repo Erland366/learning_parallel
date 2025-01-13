@@ -1,3 +1,1 @@
-print("Hello world")
-for i in range(10):
-    print(f"Hello {i}")
+from rotary import apply_rotary_emb
