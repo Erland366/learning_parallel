@@ -1,3 +1,4 @@
+%%writefile step2_process_group_manager/train.py
 """
 torchrun --nproc_per_node 2 train.py --tp_size 2 --run_name process_group_manager --use_wandb
 """
@@ -28,6 +29,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_hidden_layers", type=int, default=2)
     parser.add_argument("--num_attention_heads", type=int, default=16)
     parser.add_argument("--num_key_value_heads", type=int, default=4)
+    parser.add_argument("--hidden_size", type=int, default=512)
 
     # Training arguments
     parser.add_argument("--seed", type=int, default=42)
@@ -58,7 +60,7 @@ if __name__ == "__main__":
     backend = "nccl"
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    dtype = torch.bfloat16
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
 
     dist.init_process_group(rank=global_rank, world_size=world_size, backend=backend, init_method=f"env://", timeout=datetime.timedelta(minutes=2.0))
     setup_process_group_manager(args.dp_size, args.pp_size, args.tp_size)
@@ -85,6 +87,13 @@ if __name__ == "__main__":
     model_config.num_attention_heads = args.num_attention_heads
     model_config.num_key_value_heads = args.num_key_value_heads
     model_config.max_position_embeddings = args.seq_len
+    model_config.hidden_size = args.hidden_size
+    if not hasattr(model_config, "head_dim"):
+        model_config.head_dim = args.hidden_size // args.num_attention_heads
+    if not hasattr(model_config, "num_key_values") and hasattr(model_config, "num_key_value_heads"):
+        model_config.num_key_values = model_config.num_key_value_heads
+    if not hasattr(model_config, "hidden_dim") and hasattr(model_config, "hidden_size"):
+        model_config.hidden_dim = model_config.hidden_size
 
     model = Llama(config=model_config)
     model.to(dtype).to(device)            

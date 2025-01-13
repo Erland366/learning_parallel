@@ -18,7 +18,7 @@ def flash_attention(q, k, v, causal=True):
 
 def get_cos_sin(seq_length, head_dim, base=500000.0):
     assert (head_dim % 2) == 0, "Head dim must be divisible by 2"
-    theta = 1.0 (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float().cpu() / head_dim))
+    theta = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.int64).float().cpu() / head_dim))
     device = torch.device("cuda")
     position = torch.arange(seq_length).to(device).unsqueeze(1).float() # [S, 1]
     theta = theta.to(device)
