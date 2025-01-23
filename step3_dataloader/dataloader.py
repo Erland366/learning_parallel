@@ -5,10 +5,10 @@ from functools import partial
 from datasets import Features, Sequence,Value, load_dataset
 from transformers import AutoTokenizer
 
-import step3_dataloader.process_group_manager as pgm
+import process_group_manager as pgm
 
 class MicroBatchDataLoader(DataLoader):
-    def __init__(self, seq_len, micro_batch_size, grad_acc_steps, dataset_name, tokenizer_name, max_tokens, num_workers, num_proc, split="train"):
+    def __init__(self, seq_len, micro_batch_size, grad_acc_steps, dataset_name, tokenizer_name, max_tokens, num_workers, num_proc, split="train", max_rows=10000):
         self.micro_batch_size = micro_batch_size
         self.grad_acc_steps = grad_acc_steps
         self.seq_len = seq_len
@@ -16,11 +16,11 @@ class MicroBatchDataLoader(DataLoader):
         self.global_batch_size = micro_batch_size * grad_acc_steps * pgm.process_group_manager.dp_world_size
 
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        self.dataset = load_dataset(dataset_name, split=split)
+        self.dataset = load_dataset(dataset_name, split=split if not max_rows else f"{split}[:{max_rows}]")
 
-        self.tokenized_dataset = self.tokenizer(self.dataset, "text", max_length=self.seq_len)
+        self.tokenized_dataset = self.tokenize_dataset(self.dataset, "text", sequence_length=self.seq_len, num_proc=num_proc)
 
-        total_tokens = self.tokenized_dataset.num_row * (self.seq_len + 1)
+        total_tokens = self.tokenized_dataset.num_rows * (self.seq_len + 1)
         assert total_tokens >= max_tokens, f"Not enough tokens, Have {total_tokens} tokens but need {max_tokens} token instead"
 
         super().__init__(
@@ -71,7 +71,7 @@ class MicroBatchDataLoader(DataLoader):
             features=Features({
                 "input_ids" : Sequence(feature=Value(dtype="int64"), length=sequence_length + 1)
             }),
-            bached=True,
+            batched=True,
             num_proc=num_proc,
             load_from_cache_file=True, # Preprocess dataset only once and cache it
             desc=f"Grouping texts in chunks of {sequence_length - 1}"
@@ -90,7 +90,7 @@ class MicroBatchDataLoader(DataLoader):
 
         return {
             "input_ids" : input_ids,
-            "label_ids" : label_ids,
+            "target_ids" : label_ids,
             "position_ids" : position_ids,
             "attn_mask" : attn_mask
         }

@@ -179,10 +179,10 @@ if __name__ == "__main__":
         print(
             f"[rank {pgm.process_group_manager.global_rank}] Step: {step}, Loss: {loss:.4f}",
             f"Global batch size (with seq_len) : {to_readable_format(tokens_per_step)}",
-            f"Tokens/s : {to_readable_format(tokens_per_step / step_duration)}",
-            f"Tokens/s/GPU : {to_readable_format(tokens_per_step / step_duration / world_size)}",
+            f"Tokens/s : {to_readable_format(int(tokens_per_step / step_duration))}",
+            f"Tokens/s/GPU : {to_readable_format(int(tokens_per_step / step_duration / world_size))}",
             f"Tokens: {to_readable_format(trained_token)} / {to_readable_format(args.max_tokens)}",
-            f"Memory usage: {torch.cuda.memory_reserved / 1e9:.2f}GB"
+            f"Memory usage: {torch.cuda.memory_reserved() / 1e9:.2f}GB"
             , is_print_rank=is_wandb_rank
         )
 
