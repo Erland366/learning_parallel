@@ -3,16 +3,17 @@ import random
 import numpy as np
 import builtins
 import fcntl
+import sys
 
 def print(*args, is_print_rank=True, **kwargs):
-    """ solves multi-process interleaved print problem """
+    """solves multi-process interleaved print problem"""
     if not is_print_rank: return
-    with open(__file__, "r") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            builtins.print(*args, **kwargs)
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    fh = sys.stderr.fileno()  # Or sys.stdout.fileno()
+    fcntl.flock(fh, fcntl.LOCK_EX)
+    try:
+        builtins.print(*args, **kwargs)
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
 
 def set_all_seed(seed):
     for module in [random, np.random]: module.seed(seed)

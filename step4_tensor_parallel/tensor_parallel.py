@@ -77,7 +77,7 @@ def apply_tensor_parallel(model):
                 bias=linear_layer.bias is not None,
                 gather_output=args.get("gather_output", False)
             )
-        if _style == "row":
+        elif _style == "row":
             new_linear_layer = RowParallelLinear(
                 in_features=linear_layer.in_features,
                 out_features=linear_layer.out_features,
@@ -106,6 +106,8 @@ def apply_tensor_parallel(model):
 
     _replace_module(model, "embedding", "vocab")
     _replace_module(model, "final_proj", "column", args={"gather_output": True})
+
+    return model
 
 class ColumnParallelLinear(nn.Module):
     def __init__(self, in_features: int, out_features: int, bias: bool, gather_output: bool = False):
@@ -147,7 +149,7 @@ class ColumnParallelLinear(nn.Module):
         bound = math.sqrt(k)
         torch.nn.init.uniform_(master_weight, -bound, bound)
 
-        weight_list = torch.split(master_weight, split_size_or_sections=self.tp_world_size, dim=0)
+        weight_list = torch.split(master_weight, split_size_or_sections=self.output_size_per_partition, dim=0)
         self.weight.data = weight_list[self.tp_rank].contiguous()
 
     def forward(self, x):
@@ -169,8 +171,8 @@ class RowParallelLinear(nn.Module):
 
         self.in_features = in_features
         self.out_features = out_features
-        assert self.in_features % self.tp_rank, "In features must be a multiple of tp_rank"
-        self.in_feature_per_partition = self.out_features // self.tp_rank
+        assert self.in_features % self.tp_world_size == 0, "In features must be a multiple of tp_world_size"
+        self.in_feature_per_partition = self.in_features // self.tp_world_size
         self.weight = nn.Parameter(torch.Tensor(self.out_features, self.in_feature_per_partition))
         if bias:
             self.bias = nn.Parameter(torch.Tensor(self.out_features))
@@ -192,17 +194,15 @@ class RowParallelLinear(nn.Module):
         # Maybe we don't need to put this master weight on GPU?
         master_weights = torch.empty(self.out_features, self.in_features, dtype=self.weight.dtype, requires_grad=False)
 
-        k = 1 / self.master_weights.size(1)
+        k = 1 / master_weights.size(1)
         bound = math.sqrt(k)
         torch.nn.init.uniform_(master_weights, -bound, bound)
 
-        weight_list = torch.split(master_weights, self.tp_world_size, dim=1)
+        weight_list = torch.split(master_weights, self.in_feature_per_partition, dim=1)
         self.weight.data = weight_list[self.tp_rank].contiguous()
 
     def forward(self, x):
-        input_parallel = Copy.apply(x)
-
-        output = F.linear(input_parallel, self.weight)
+        output = F.linear(x, self.weight)
 
         output = Reduce.apply(output)
 
@@ -257,35 +257,32 @@ class VocabParallelEmbedding(nn.Module):
         master_weight = torch.empty(self.num_embeddings, self.embedding_dim, dtype=self.weight.dtype, requires_grad=False)
         torch.nn.init.normal_(master_weight, mean=0.0, std=1.0)
 
-        weight_list = torch.split(master_weight, self.tp_world_size, dim=0)
+        weight_list = torch.split(master_weight, self.num_embeddings_per_partition, dim=0)
         self.weight.data = weight_list[self.tp_rank].contiguous()
 
-    def forward(self, x):
+    def forward(self, input):
         """
-        Perform an embedding lookup for input tokens in the parallelized embedding layer
-        1. Masks tokens that fall outside the specified vocabulary range and ajust the input
-        2. Perform embedding lookups for valid tokens, setting embeddings of out-of-vocabulary tokens to zero
+        Performs an embedding lookup for input tokens in the parallelized embedding layer
+        1. Masks tokens that fall outside the specified vocabulary range and adjusts the input
+        2. Performs embedding lookups for valid tokens, setting embeddings of out-of-vocabulary tokens to zero
         3. Reduces the embeddings across model parallel GPUs using all-reduce for synchronization
         """
-        input_mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
-        # Mask the input
-        # This has to be calculated relative to the local GPU
-        # Basically if the input is in index 12000, but this GPU works on embedding
-        # That starts with 10000, we need to move the input to be 2000
-
-        # After thinking about it, it's very similar with how we mask in the Triton Kernel
-        masked_input = x.clone() - self.vocab_start_idx
+        # Build the mask for out-of-vocabulary tokens.
+        input_mask = (input < self.vocab_start_idx) | (input >= self.vocab_end_idx)
+        # Mask the input.
+        masked_input = input.clone() - self.vocab_start_idx
         masked_input[input_mask] = 0
+        # Get the embeddings for the valid tokens.
         output_parallel = F.embedding(
-            masked_input, 
-            self.weight, 
-            self.padding_idx, 
-            self.max_norm, 
-            self.norm_type, 
-            self.scaled_grad_by_freq, 
-            self.sparse
+            masked_input,
+            self.weight,
+            self.padding_idx,
+            self.max_norm,
+            self.norm_type,
+            self.scaled_grad_by_freq,
+            self.sparse,
         )
-        # Again, this is to make sure that these are zeros
+        # Embedding of out-of-vocabulary tokens is set to 0.
         output_parallel[input_mask, :] = 0.0
-        output = Reduce.apply(output)
+        output = Reduce.apply(output_parallel)
         return output
