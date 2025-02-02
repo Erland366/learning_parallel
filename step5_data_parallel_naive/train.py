@@ -1,6 +1,25 @@
 """
-torchrun --nproc_per_node 2 step4_tensor_parallel/train.py --tp_size 2 --run_name process_group_manager --use_wandb --micro_batch_size 4 --gradient_accumulation_steps 8 --max_tokens 4096 --num_proc 16 --run_name tp_naive 
-debugpy-run -m torch.distributed.run -- --nproc_per_node 2 step4_tensor_parallel/train.py --tp_size 2 --run_name process_group_manager --use_wandb --micro_batch_size 4 --gradient_accumulation_steps 8 --max_tokens 4096 --num_proc 16 --run_name tp_naive 
+torchrun --nproc_per_node 2 step5_data_parallel_naive/train.py \
+    --tp_size 1 \
+    --dp_size 2 \
+    --run_name process_group_manager \
+    --use_wandb \
+    --micro_batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --max_tokens 4096 \
+    --num_proc 16 \
+    --run_name tp_naive 
+
+debugpy-run -m torch.distrbuted.run -- --nproc_per_node 2 step5_data_parallel_naive/train.py \
+    --tp_size 1 \
+    --dp_size 2 \
+    --run_name process_group_manager \
+    --use_wandb \
+    --micro_batch_size 4 \
+    --gradient_accumulation_steps 8 \
+    --max_tokens 4096 \
+    --num_proc 16 \
+    --run_name tp_naive 
 """
 from __future__ import annotations
 import os
@@ -17,6 +36,7 @@ from transformers import AutoConfig
 import lovely_tensors as lt; lt.monkey_patch()
 
 from dataloader import MicroBatchDataLoader
+from data_parallel import DataParallelNaive
 from model import Llama
 import process_group_manager as pgm
 from process_group_manager import setup_process_group_manager
@@ -28,10 +48,15 @@ os.environ["WANDB_DISABLED"] = "true"
 def train_step(model: str, dataloader: "torch.utils.data.DataLoader", device):
     acc_loss = 0.0
 
+    requires_grad_sync = pgm.process_group_manager.dp_world_size > 1
+
     for i in range(dataloader.grad_acc_steps):
         batch = next(dataloader)
         input_ids = batch["input_ids"].to(device)
         target_ids = batch["target_ids"].to(device)
+
+        if requires_grad_sync:
+            model.require_backward_grad_sync = (i == dataloader.grad_acc_steps - 1)
 
         outputs = model(input_ids=input_ids) # B, S, V
 
@@ -138,7 +163,13 @@ if __name__ == "__main__":
     if pgm.process_group_manager.tp_world_size > 1:
         model = apply_tensor_parallel(model)
 
+    # Need to move the model to the device before wrapping it with DataParallel
+    # Otherwise, the hook will get attached to the CPU model and not the GPU model 
     model.to(dtype).to(device)
+
+    if pgm.process_group_manager.dp_world_size > 1:
+        model = DataParallelNaive(model)
+
     model.train()
 
     dist.barrier()
@@ -157,6 +188,7 @@ if __name__ == "__main__":
         max_tokens=args.max_tokens,
         num_workers=args.num_workers,
         num_proc=args.num_proc,
+        seed=args.seed,
     )
 
     # So this is assuming a pretrain phase where all the data sequence lengths 
@@ -182,6 +214,10 @@ if __name__ == "__main__":
         step_duration = time.time() - step_start_time
         trained_token += tokens_per_step
         step += 1
+
+        # In DDP implementation, we need to reset the gradient buffers
+        if hasattr(model, "reset"):
+            model.reset()
 
         print(
             f"[rank {pgm.process_group_manager.global_rank}] Step: {step}, Loss: {loss:.4f}",
