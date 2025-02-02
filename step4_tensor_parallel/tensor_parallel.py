@@ -122,6 +122,7 @@ class ColumnParallelLinear(nn.Module):
         self.output_size_per_partition = self.out_features // self.tp_world_size
         self.gather_output = gather_output
 
+        # Note: torch.nn.functional.linear performs XW^T + b so we need to swap the dimension
         self.weight = nn.Parameter(torch.Tensor(self.output_size_per_partition, self.in_features)) # W_i
         if bias:
             self.bias = nn.Parameter(torch.Tensor(self.output_size_per_partition))
