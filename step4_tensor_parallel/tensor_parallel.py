@@ -108,10 +108,184 @@ def apply_tensor_parallel(model):
     _replace_module(model, "final_proj", "column", args={"gather_output": True})
 
 class ColumnParallelLinear(nn.Module):
-    pass
+    def __init__(self, in_features: int, out_features: int, bias: bool, gather_output: bool = False):
+        super().__init__()
+
+        self.tp_world_size = pgm.process_group_manager.tp_world_size
+        self.tp_rank = pgm.process_group_manager.tp_rank
+
+        self.in_features = in_features
+        self.out_features = out_features
+        assert out_features % self.tp_world_size == 0, "Hidden dimension must be divisible by the tensor parallel world size"
+        self.output_size_per_partition = self.out_features // self.tp_world_size
+        self.gather_output = gather_output
+
+        self.weight = nn.Parameter(torch.Tensor(self.output_size_per_partition, self.in_features)) # W_i
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(self.output_size_per_partition))
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.tp_world_size == 1:
+            # U(-sqrt(k), sqrt(k))
+            k = 1 / self.weight.size(1) # it's based on the input dimension
+            bound = math.sqrt(k)
+            torch.nn.init.uniform_(self.weight, -bound, bound)
+            return
+
+        # When TP > 1, Initialize master weights
+        # We don't need to put the master weight on the GPU
+        master_weight = torch.empty(self.out_features, self.in_features, dtype=self.weight.dtype, requires_grad=False)
+
+        # Initialized based on the master weight
+        k = 1 / self.weight.size(1) # it's based on the input dimension
+        bound = math.sqrt(k)
+        torch.nn.init.uniform_(master_weight, -bound, bound)
+
+        weight_list = torch.split(master_weight, split_size_or_sections=self.tp_world_size, dim=0)
+        self.weight.data = weight_list[self.tp_rank].contiguous()
+
+    def forward(self, x):
+        input_parallel = Copy.apply(x)
+        # XW_i^T + b, output is y_i
+
+        output = F.linear(input_parallel, self.weight, self.bias)
+        if self.gather_output:
+            output = Gather.apply(output)
+        return output
+
 
 class RowParallelLinear(nn.Module):
-    pass
+    def __init__(self, in_features: int, out_features: int, bias: bool):
+        super().__init__()
+
+        self.tp_world_size = pgm.process_group_manager.tp_world_size
+        self.tp_rank = pgm.process_group_manager.tp_rank
+
+        self.in_features = in_features
+        self.out_features = out_features
+        assert self.in_features % self.tp_rank, "In features must be a multiple of tp_rank"
+        self.in_feature_per_partition = self.out_features // self.tp_rank
+        self.weight = nn.Parameter(torch.Tensor(self.out_features, self.in_feature_per_partition))
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(self.out_features))
+            with torch.no_grad():
+                self.bias.zero_()
+        else:
+            self.register_parameter("bias", None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if pgm.process_group_manager.tp_world_size == 1:
+            # Apply initialization by random uniform of k
+            k = 1 / self.weight.size(1)
+            bound = math.sqrt(k)
+            torch.nn.init.uniform_(self.weight, -bound, bound)
+            return
+        # Create full bound first
+        # Maybe we don't need to put this master weight on GPU?
+        master_weights = torch.empty(self.out_features, self.in_features, dtype=self.weight.dtype, requires_grad=False)
+
+        k = 1 / self.master_weights.size(1)
+        bound = math.sqrt(k)
+        torch.nn.init.uniform_(master_weights, -bound, bound)
+
+        weight_list = torch.split(master_weights, self.tp_world_size, dim=1)
+        self.weight.data = weight_list[self.tp_rank].contiguous()
+
+    def forward(self, x):
+        input_parallel = Copy.apply(x)
+
+        output = F.linear(input_parallel, self.weight)
+
+        output = Reduce.apply(output)
+
+        return output if self.bias is None else output + self.bias
 
 class VocabParallelEmbedding(nn.Module):
-    pass
+    def __init__(
+        self, 
+        num_embeddings: int, 
+        embedding_dim: int, 
+        padding_idx: Optional[int] = None,
+        max_norm: Optional[float] = None,
+        norm_type: float = 2.0,
+        scaled_grad_by_freq: bool = False,
+        sparse: bool = False
+    ):
+        super().__init__()
+
+        self.tp_world_size = pgm.process_group_manager.tp_world_size
+        self.tp_rank = pgm.process_group_manager.tp_rank
+
+        self.num_embeddings = num_embeddings
+        self.sparse = sparse
+        self.scaled_grad_by_freq = scaled_grad_by_freq
+        self.norm_type = norm_type
+        self.max_norm = max_norm
+        self.padding_idx = padding_idx
+        self.embedding_dim = embedding_dim
+
+        self.vocab_start_idx, self.vocab_end_idx = self._vocab_range_from_global_vocab_size(
+            self.num_embeddings, pgm.process_group_manager.tp_rank, pgm.process_group_manager.tp_world_size
+        )
+        self.num_embeddings_per_partition = self.vocab_end_idx - self.vocab_start_idx
+
+        self.weight = nn.Parameter(torch.Tensor(self.num_embeddings_per_partition, self.embedding_dim))
+
+        self.reset_parameters()
+
+    def _vocab_range_from_global_vocab_size(self, global_vocab_size: int, rank: int, world_size: int):
+        assert global_vocab_size % world_size == 0, f"{global_vocab_size} is not divisible by {world_size}" 
+        per_partition_vocab_size = global_vocab_size // world_size
+        index_f = rank * per_partition_vocab_size
+        index_l = index_f + per_partition_vocab_size
+        return index_f, index_l
+
+    def reset_parameters(self):
+        if self.tp_world_size == 1:
+            # Initialize vocab embedding with N(0, 1)
+            torch.nn.init.normal_(self.weight, mean=0.0, std=1.0)
+            return
+
+        master_weight = torch.empty(self.num_embeddings, self.embedding_dim, dtype=self.weight.dtype, requires_grad=False)
+        torch.nn.init.normal_(master_weight, mean=0.0, std=1.0)
+
+        weight_list = torch.split(master_weight, self.tp_world_size, dim=0)
+        self.weight.data = weight_list[self.tp_rank].contiguous()
+
+    def forward(self, x):
+        """
+        Perform an embedding lookup for input tokens in the parallelized embedding layer
+        1. Masks tokens that fall outside the specified vocabulary range and ajust the input
+        2. Perform embedding lookups for valid tokens, setting embeddings of out-of-vocabulary tokens to zero
+        3. Reduces the embeddings across model parallel GPUs using all-reduce for synchronization
+        """
+        input_mask = (x < self.vocab_start_idx) | (x >= self.vocab_end_idx)
+        # Mask the input
+        # This has to be calculated relative to the local GPU
+        # Basically if the input is in index 12000, but this GPU works on embedding
+        # That starts with 10000, we need to move the input to be 2000
+
+        # After thinking about it, it's very similar with how we mask in the Triton Kernel
+        masked_input = x.clone() - self.vocab_start_idx
+        masked_input[input_mask] = 0
+        output_parallel = F.embedding(
+            masked_input, 
+            self.weight, 
+            self.padding_idx, 
+            self.max_norm, 
+            self.norm_type, 
+            self.scaled_grad_by_freq, 
+            self.sparse
+        )
+        # Again, this is to make sure that these are zeros
+        output_parallel[input_mask, :] = 0.0
+        output = Reduce.apply(output)
+        return output

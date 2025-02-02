@@ -1,5 +1,5 @@
 """
-torchrun --nproc_per_node 2 train.py --tp_size 2 --run_name process_group_manager --use_wandb --micro_batch_size 4 --gradient_accumulation_steps 8 --max_tokens 4096 --num_proc 16 --run_name dataloader 
+torchrun --nproc_per_node 2 train.py --tp_size 2 --run_name process_group_manager --use_wandb --micro_batch_size 4 --gradient_accumulation_steps 8 --max_tokens 4096 --num_proc 16 --run_name tp_naive 
 """
 from __future__ import annotations
 import os
@@ -19,6 +19,7 @@ from dataloader import MicroBatchDataLoader
 from model import Llama
 import process_group_manager as pgm
 from process_group_manager import setup_process_group_manager
+from tensor_parallel import apply_tensor_parallel
 from utils import set_all_seed, print, to_readable_format
 
 def train_step(model: str, dataloader: "torch.utils.data.DataLoader", device):
@@ -131,7 +132,10 @@ if __name__ == "__main__":
         model_config.hidden_dim = model_config.hidden_size
 
     model = Llama(config=model_config)
-    model.to(dtype).to(device)            
+    if pgm.process_group_manager.tp_world_size > 1:
+        model = apply_tensor_parallel(model)
+
+    model.to(dtype).to(device)
     model.train()
 
     dist.barrier()

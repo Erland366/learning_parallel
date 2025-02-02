@@ -6,6 +6,7 @@ sys.path.append(".")
 from kernel import layer_norm_fn
 from rotary import apply_rotary_emb
 import torch.nn as nn
+import process_group_manager as pgm
 from torch.nn import functional as F
 
 dtype = torch.float32 # torch.cuda.is_bf16_supported() is broken on Kaggle
@@ -49,8 +50,10 @@ class Attention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.num_key_values = config.num_key_values
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_local_heads = config.num_attention_heads
-        self.num_local_kv_heads = config.num_key_value_heads
+        assert config.num_attention_heads % pgm.process_group_manager.tp_world_size == 0, "num_attention_heads should be divisible by tp_world_size"
+        assert config.num_key_value_heads % pgm.process_group_manager.tp_world_size == 0, "num_key_value_heads should be divisible by tp_world_size"
+        self.num_local_heads = config.num_attention_heads // pgm.process_group_manager.tp_world_size # TP Parallelism
+        self.num_local_kv_heads = config.num_key_value_heads // pgm.process_group_manager.tp_world_size # TP Parallelism
 
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_values * self.head_dim, bias=False)
